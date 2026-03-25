@@ -103,7 +103,7 @@ def get_thinking_settings(model_name: str) -> tuple[Optional[int], Optional[str]
         # nothinking 模式: 限制思考
         if "flash" in base_model:
             return 0, None
-        return 128, None
+        return 512, None
     elif "-maxthinking" in model_name:
         # maxthinking 模式: 最大思考预算
         budget = 24576 if "flash" in base_model else 32768

@@ -509,6 +509,8 @@ def get_thinking_settings(model_name: str) -> tuple[Optional[int], Optional[str]
         # nothinking 模式: 限制思考
         if "flash" in base_model:
             return 0, None
+        if "gemini-2.5" in base_model:
+            return 256, None
         return 128, None
     elif "-maxthinking" in model_name:
         # maxthinking 模式: 最大思考预算
@@ -645,7 +647,9 @@ async def normalize_gemini_request(
             base_model = get_base_model_name(model)
             if "pro" in base_model:
                 include_thoughts = return_thoughts
-            elif "3-flash" in base_model:
+            elif "gemini-3" in base_model and "flash" in base_model:
+                # Gemini 3 系列的 flash 模型 (3-flash / 3.5-flash 等):
+                # 仅在显式设置了思考等级时才返回思考内容
                 if thinking_level is None:
                     include_thoughts = False
                 else:

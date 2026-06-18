@@ -496,7 +496,9 @@ def get_thinking_settings(model_name: str) -> tuple[Optional[int], Optional[str]
 
     支持两种模式:
     1. CLI 模式思考预算 (Gemini 2.5 系列): -max, -high, -medium, -low, -minimal
-    2. CLI 模式思考等级 (Gemini 3 Preview 系列): -high, -medium, -low, -minimal (仅 3-flash)
+    2. CLI 模式思考等级 (Gemini 3 系列，含 flash / pro / preview / 非 preview): -high, -medium, -low, -minimal
+       - flash 模型支持 high/medium/low/minimal
+       - pro 模型支持 low
     3. 兼容旧模式: -maxthinking, -nothinking (不返回给用户)
 
     Returns:
@@ -523,12 +525,12 @@ def get_thinking_settings(model_name: str) -> tuple[Optional[int], Optional[str]
 
     # ========== 新 CLI 模式: 基于思考预算/等级 ==========
 
-    # Gemini 3 Preview 系列: 使用 thinkingLevel
+    # Gemini 3 系列 (含 flash / pro / preview / 非 preview): 使用 thinkingLevel
     if "gemini-3" in base_model:
         if "-high" in model_name:
             return None, "high"
         elif "-medium" in model_name:
-            # 仅 3-flash-preview 支持 medium
+            # 仅 3 系列 flash 模型 (3-flash / 3-flash-preview / 3.5-flash 等) 支持 medium
             if "flash" in base_model:
                 return None, "medium"
             # pro 系列不支持 medium，返回 Default

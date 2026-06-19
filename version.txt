@@ -1,4 +1,4 @@
-full_hash=9c4f3035bf5e0ac11abbce4d6fe5076d94b42c7b
-short_hash=9c4f303
-message=Add hourly usage aggregation
-date=2026-06-20 02:44:42 +0800
+full_hash=7b4655950afe6c0ef9af95c611e311aaf77e326f
+short_hash=7b46559
+message=Inject usage stats frontend patch with cache busting
+date=2026-06-20 02:46:27 +0800

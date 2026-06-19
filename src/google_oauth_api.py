@@ -536,7 +536,8 @@ async def fetch_project_id_and_tier(
     user_agent: str,
     api_base_url: str,
     include_credits: bool = False,
-) -> Tuple[Optional[str], Optional[str]] | Tuple[Optional[str], Optional[str], Optional[int]]:
+    detailed: bool = False,
+):
     """
     从 API 获取 project_id 和订阅等级
 
@@ -544,11 +545,13 @@ async def fetch_project_id_and_tier(
         access_token: Google OAuth access token
         user_agent: User-Agent header
         api_base_url: API base URL (e.g., antigravity or code assist endpoint)
+        detailed: 为 True 时返回完整 tier 详情（含原始 id/name，不落库）
 
     Returns:
         默认返回 (project_id, subscription_tier)
         当 include_credits=True 时返回 (project_id, subscription_tier, credit_amount)
-        subscription_tier 可能是 "FREE", "PRO", "ULTRA" 或 None
+        当 detailed=True 时，在上述元组末尾追加 tier_details dict
+        subscription_tier 为规范化类别（free/pro/ultra），可能为 None
         credit_amount 为积分数量（整数）或 None
     """
     headers = {
@@ -576,10 +579,11 @@ async def fetch_project_id_and_tier(
 
     subscription_tier = None
     credit_amount: Optional[int] = None
+    tier_details: dict = {}
 
     # 步骤 1: 尝试 loadCodeAssist
     try:
-        project_id, raw_tier, raw_credit_amount = await _try_load_code_assist(api_base_url, headers)
+        project_id, raw_tier, raw_credit_amount, tier_details = await _try_load_code_assist(api_base_url, headers)
         subscription_tier = _map_raw_tier(raw_tier)
 
         if raw_credit_amount is not None:
@@ -599,6 +603,8 @@ async def fetch_project_id_and_tier(
             )
 
         if project_id:
+            if detailed:
+                return project_id, subscription_tier, credit_amount, tier_details
             if include_credits:
                 return project_id, subscription_tier, credit_amount
             return project_id, subscription_tier
@@ -613,11 +619,15 @@ async def fetch_project_id_and_tier(
     try:
         project_id = await _try_onboard_user(api_base_url, headers)
         if project_id:
+            if detailed:
+                return project_id, subscription_tier, credit_amount, tier_details
             if include_credits:
                 return project_id, subscription_tier, credit_amount
             return project_id, subscription_tier
 
         log.error("[fetch_project_id_and_tier] Failed to get project_id from both loadCodeAssist and onboardUser")
+        if detailed:
+            return None, subscription_tier, credit_amount, tier_details
         if include_credits:
             return None, subscription_tier, credit_amount
         return None, subscription_tier
@@ -626,22 +636,98 @@ async def fetch_project_id_and_tier(
         log.error(f"[fetch_project_id_and_tier] onboardUser failed: {type(e).__name__}: {e}")
         import traceback
         log.debug(f"[fetch_project_id_and_tier] Traceback: {traceback.format_exc()}")
+        if detailed:
+            return None, subscription_tier, credit_amount, tier_details
         if include_credits:
             return None, subscription_tier, credit_amount
         return None, subscription_tier
 
 
+def _classify_tier_for_display(raw_id: Optional[str], raw_name: Optional[str]) -> str:
+    """
+    将后端返回的原始 tier id/name 分类为前端显示用类别。
+    不兜底成 pro，未知 tier 保留为 unknown，避免 enterprise 等被误判。
+
+    Returns:
+        free / legacy / standard / enterprise / ultra / pro / unknown
+    """
+    text = f"{raw_id or ''} {raw_name or ''}".lower()
+
+    if "enterprise" in text:
+        return "enterprise"
+    if "standard" in text or raw_id == "standard-tier":
+        return "standard"
+    if raw_id == "legacy-tier" or "legacy" in text:
+        return "legacy"
+    if raw_id == "free-tier":
+        return "free"
+    if "ultra" in text:
+        return "ultra"
+    if "pro" in text:
+        return "pro"
+    if not raw_id and not raw_name:
+        return "unknown"
+    return "unknown"
+
+
+def _extract_tier_details(data: dict) -> dict:
+    """
+    从 loadCodeAssist 响应中提取完整 tier 信息（原始字段，用于前端展示，不落库）。
+
+    Returns:
+        {
+            "tier_id": ..., "tier_name": ..., "tier_source": "paidTier"|"currentTier"|None,
+            "paid_tier_id": ..., "paid_tier_name": ...,
+            "current_tier_id": ..., "current_tier_name": ...,
+            "allowed_tiers": [], "ineligible_tiers": [], "available_credits": [],
+            "raw": {完整 LoadCodeAssistResponse}
+        }
+    """
+    paid_tier = data.get("paidTier") or {}
+    current_tier = data.get("currentTier") or {}
+    if not isinstance(paid_tier, dict):
+        paid_tier = {}
+    if not isinstance(current_tier, dict):
+        current_tier = {}
+
+    paid_id = paid_tier.get("id")
+    paid_name = paid_tier.get("name")
+    current_id = current_tier.get("id")
+    current_name = current_tier.get("name")
+
+    # 优先 paidTier
+    tier_id = paid_id or current_id
+    tier_name = paid_name or current_name
+    tier_source = "paidTier" if paid_id else ("currentTier" if current_id else None)
+
+    return {
+        "tier_id": tier_id,
+        "tier_name": tier_name,
+        "tier_source": tier_source,
+        "tier_display": _classify_tier_for_display(tier_id, tier_name),
+        "paid_tier_id": paid_id,
+        "paid_tier_name": paid_name,
+        "current_tier_id": current_id,
+        "current_tier_name": current_name,
+        "allowed_tiers": data.get("allowedTiers") or [],
+        "ineligible_tiers": data.get("ineligibleTiers") or [],
+        "available_credits": paid_tier.get("availableCredits") or current_tier.get("availableCredits") or [],
+        "raw": data,
+    }
+
+
 async def _try_load_code_assist(
     api_base_url: str,
     headers: dict
-) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+) -> Tuple[Optional[str], Optional[str], Optional[str], dict]:
     """
     尝试通过 loadCodeAssist 获取 project_id 和订阅等级
 
     Returns:
-        (project_id, subscription_tier, credit_amount) 元组
-        subscription_tier 可能是 "FREE", "PRO", "ULTRA" 或 None
+        (project_id, subscription_tier, credit_amount, tier_details) 元组
+        subscription_tier 为后端原始 tier id（如 standard-tier），可能为 None
         credit_amount 为字符串格式积分或 None
+        tier_details 为完整 tier 信息字典（失败时为空字典）
     """
     request_url = f"{api_base_url.rstrip('/')}/v1internal:loadCodeAssist"
     request_body = {
@@ -669,22 +755,17 @@ async def _try_load_code_assist(
         data = response.json()
         log.debug(f"[loadCodeAssist] Response JSON keys: {list(data.keys())}")
 
-        # 提取订阅等级 - 优先使用 paidTier（更准确反映实际权益）
-        paid_tier = data.get("paidTier", {})
-        current_tier = data.get("currentTier", {})
-        available_credits = paid_tier.get("availableCredits", []) if isinstance(paid_tier, dict) else []
+        # 提取完整 tier 详情（用于前端展示，不落库）
+        tier_details = _extract_tier_details(data)
 
-        # paidTier.id 优先，然后是 currentTier.id
-        subscription_tier = None
-        if isinstance(paid_tier, dict) and paid_tier.get("id"):
-            subscription_tier = paid_tier.get("id")
-            log.info(f"[loadCodeAssist] Found paidTier: {subscription_tier}")
-        elif isinstance(current_tier, dict) and current_tier.get("id"):
-            subscription_tier = current_tier.get("id")
-            log.info(f"[loadCodeAssist] Found currentTier: {subscription_tier}")
+        # 兼容旧逻辑：subscription_tier 取原始 tier id
+        subscription_tier = tier_details.get("tier_id")
+        if subscription_tier:
+            log.info(f"[loadCodeAssist] Found {tier_details.get('tier_source')}: {subscription_tier}")
 
         # 提取积分数量（如果返回了 availableCredits）
         credit_amount = None
+        available_credits = tier_details.get("available_credits") or []
         if isinstance(available_credits, list) and available_credits:
             first_credit = available_credits[0]
             if isinstance(first_credit, dict):
@@ -693,24 +774,174 @@ async def _try_load_code_assist(
                     log.info(f"[loadCodeAssist] Found creditAmount: {credit_amount}")
 
         # 检查是否有 currentTier（表示用户已激活）
-        if current_tier:
+        if tier_details.get("current_tier_id") or data.get("currentTier"):
             log.info("[loadCodeAssist] User is already activated")
 
             # 使用服务器返回的 project_id
             project_id = data.get("cloudaicompanionProject")
             if project_id:
                 log.info(f"[loadCodeAssist] Successfully fetched project_id: {project_id}, tier: {subscription_tier}")
-                return project_id, subscription_tier, credit_amount
+                return project_id, subscription_tier, credit_amount, tier_details
 
             log.warning("[loadCodeAssist] No project_id in response")
-            return None, subscription_tier, credit_amount
+            return None, subscription_tier, credit_amount, tier_details
         else:
             log.info("[loadCodeAssist] User not activated yet (no currentTier)")
-            return None, None, credit_amount
+            return None, None, credit_amount, tier_details
     else:
         log.warning(f"[loadCodeAssist] Failed: HTTP {response.status_code}")
         log.warning(f"[loadCodeAssist] Response body: {response.text[:500]}")
         raise Exception(f"HTTP {response.status_code}: {response.text[:200]}")
+
+
+async def retrieve_user_quota(
+    access_token: str,
+    user_agent: str,
+    api_base_url: str,
+    project_id: str,
+    user_agent_model: str = "",
+) -> Dict[str, Any]:
+    """
+    查询 geminicli 凭证的额度信息（对应官方 retrieveUserQuota）。
+
+    Args:
+        access_token: 访问令牌
+        user_agent: User-Agent
+        api_base_url: code assist 端点
+        project_id: cloudaicompanionProject 或 credential_data.project_id
+        user_agent_model: 用于 UA 的模型名（可选）
+
+    Returns:
+        {
+            "success": bool,
+            "project_id": str,
+            "quotas": [
+                {
+                    "model_id": str, "remaining_amount": int, "remaining_fraction": float,
+                    "limit": int, "percent_remaining": int, "reset_time": str,
+                    "token_type": str
+                }
+            ],
+            "has_access_to_preview_model": bool,
+            "raw": {完整 RetrieveUserQuotaResponse}
+        }
+    """
+    headers = {
+        'User-Agent': user_agent,
+        'Authorization': f'Bearer {access_token}',
+        'Content-Type': 'application/json',
+        'Accept-Encoding': 'gzip'
+    }
+
+    request_url = f"{api_base_url.rstrip('/')}/v1internal:retrieveUserQuota"
+    request_body = {"project": project_id}
+
+    log.debug(f"[retrieveUserQuota] Fetching quota from: {request_url}")
+    log.debug(f"[retrieveUserQuota] Request body: {request_body}")
+
+    try:
+        response = await post_async(
+            request_url,
+            json=request_body,
+            headers=headers,
+            timeout=30.0,
+        )
+
+        log.debug(f"[retrieveUserQuota] Response status: {response.status_code}")
+
+        if response.status_code != 200:
+            error_text = response.text[:500] if hasattr(response, 'text') else ""
+            log.warning(f"[retrieveUserQuota] Failed: HTTP {response.status_code}, body: {error_text}")
+            return {
+                "success": False,
+                "project_id": project_id,
+                "quotas": [],
+                "has_access_to_preview_model": False,
+                "error": f"HTTP {response.status_code}: {error_text}",
+                "raw": {},
+            }
+
+        data = response.json()
+        log.debug(f"[retrieveUserQuota] Response keys: {list(data.keys())}")
+
+        buckets = data.get("buckets") or []
+        if not isinstance(buckets, list):
+            buckets = []
+
+        quotas: List[Dict[str, Any]] = []
+        has_access_to_preview_model = False
+        previous_limit = 0
+
+        for bucket in buckets:
+            if not isinstance(bucket, dict):
+                continue
+
+            remaining_amount_raw = bucket.get("remainingAmount")
+            remaining_fraction = bucket.get("remainingFraction")
+            model_id = bucket.get("modelId", "")
+            token_type = bucket.get("tokenType", "")
+            reset_time = bucket.get("resetTime", "")
+
+            # 按官方逻辑计算 remaining / limit
+            if remaining_amount_raw is not None:
+                try:
+                    remaining = int(remaining_amount_raw)
+                except (TypeError, ValueError):
+                    remaining = 0
+                if remaining_fraction is not None and remaining_fraction > 0:
+                    limit = round(remaining / remaining_fraction)
+                else:
+                    limit = previous_limit
+            else:
+                limit = 100
+                if remaining_fraction is not None:
+                    remaining = round(remaining_fraction * 100)
+                else:
+                    remaining = 0
+
+            if limit > 0:
+                previous_limit = limit
+
+            percent_remaining = round(remaining / limit * 100) if limit > 0 else 0
+            if percent_remaining > 100:
+                percent_remaining = 100
+            if percent_remaining < 0:
+                percent_remaining = 0
+
+            # preview 模型检测（与官方一致）
+            if model_id and "preview" in model_id.lower():
+                has_access_to_preview_model = True
+
+            quotas.append({
+                "model_id": model_id,
+                "remaining_amount": remaining,
+                "remaining_fraction": remaining_fraction if remaining_fraction is not None else 0,
+                "limit": limit,
+                "percent_remaining": percent_remaining,
+                "reset_time": reset_time,
+                "token_type": token_type,
+            })
+
+        log.info(f"[retrieveUserQuota] Got {len(quotas)} buckets, preview_access={has_access_to_preview_model}")
+
+        return {
+            "success": True,
+            "project_id": project_id,
+            "quotas": quotas,
+            "has_access_to_preview_model": has_access_to_preview_model,
+            "raw": data,
+        }
+
+    except Exception as e:
+        log.error(f"[retrieveUserQuota] Exception: {type(e).__name__}: {e}")
+        return {
+            "success": False,
+            "project_id": project_id,
+            "quotas": [],
+            "has_access_to_preview_model": False,
+            "error": f"{type(e).__name__}: {e}",
+            "raw": {},
+        }
 
 
 async def _try_onboard_user(

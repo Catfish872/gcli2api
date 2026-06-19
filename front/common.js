@@ -664,10 +664,21 @@ function createCredCard(credInfo, manager) {
     }
 
     // tier 状态显示 (geminicli 和 antigravity 都显示)
-    const tier = (credInfo.tier || 'pro').toString().toLowerCase();
-    const tierLabel = tier.toUpperCase();
-    const tierColor = tier === 'ultra' ? '#ff9800' : (tier === 'free' ? '#607d8b' : '#2e7d32');
-    statusBadges += `<span class="status-badge" style="background-color: ${tierColor}; color: white;" title="凭证等级: ${tierLabel}">Tier: ${tierLabel}</span>`;
+    // 支持 standard/enterprise/legacy/unknown 等显示分类（来自 verify/quota 返回的 tier_display，或状态表 tier）
+    const tierDisplay = (credInfo.tier_display || credInfo.tier || 'pro').toString().toLowerCase();
+    const tierId = credInfo.tier_id || '';
+    let tierLabel, tierColor;
+    switch (tierDisplay) {
+        case 'ultra': tierLabel = 'ULTRA'; tierColor = '#ff9800'; break;
+        case 'standard': tierLabel = 'Standard'; tierColor = '#6f42c1'; break;
+        case 'enterprise': tierLabel = 'Enterprise'; tierColor = '#4a148c'; break;
+        case 'legacy': tierLabel = 'Legacy'; tierColor = '#607d8b'; break;
+        case 'free': tierLabel = 'FREE'; tierColor = '#607d8b'; break;
+        case 'unknown': tierLabel = tierId ? tierId : 'Unknown'; tierColor = '#78909c'; break;
+        default: tierLabel = tierDisplay.toUpperCase(); tierColor = '#2e7d32';
+    }
+    const tierTitle = tierId ? `凭证等级: ${tierLabel} (原始: ${tierId})` : `凭证等级: ${tierLabel}`;
+    statusBadges += `<span class="status-badge tier-badge" style="background-color: ${tierColor}; color: white;" title="${tierTitle}" data-filename="${filename}">Tier: ${tierLabel}</span>`;
 
     // Credit 状态显示（仅 antigravity）
     if (managerType === 'antigravity') {
@@ -719,6 +730,7 @@ function createCredCard(credInfo, manager) {
         <button class="cred-btn download" onclick="download${managerType === 'antigravity' ? 'Antigravity' : ''}Cred('${filename}')">下载</button>
         <button class="cred-btn email" onclick="fetch${managerType === 'antigravity' ? 'Antigravity' : ''}UserEmail('${filename}')">查看账号邮箱</button>
         ${managerType === 'antigravity' ? `<button class="cred-btn" onclick="toggleAntigravityQuotaDetails('${pathId}')" title="查看该凭证的额度信息">查看额度</button>` : ''}
+        ${managerType === 'geminicli' ? `<button class="cred-btn" onclick="toggleGeminicliQuotaDetails('${pathId}')" title="查看该凭证的额度信息（geminicli）">查看额度</button>` : ''}
         ${managerType === 'antigravity' ? (credInfo.enable_credit
             ? `<button class="cred-btn" data-filename="${filename}" data-action="disable_credit" title="关闭该凭证的Credit模式">关闭 Credit</button>`
             : `<button class="cred-btn" data-filename="${filename}" data-action="enable_credit" title="开启该凭证的Credit模式">开启 Credit</button>`
@@ -756,6 +768,13 @@ function createCredCard(credInfo, manager) {
             <div class="cred-content" data-filename="${filename}" data-loaded="false" style="background-color: #fff3cd; border-color: #ffc107;">点击"查看报错"按钮加载报错信息...</div>
         </div>
         ${managerType === 'antigravity' ? `
+        <div class="cred-quota-details" id="quota-${pathId}" style="display: none;">
+            <div class="cred-quota-content" data-filename="${filename}" data-loaded="false">
+                点击"查看额度"按钮加载额度信息...
+            </div>
+        </div>
+        ` : ''}
+        ${managerType === 'geminicli' ? `
         <div class="cred-quota-details" id="quota-${pathId}" style="display: none;">
             <div class="cred-quota-content" data-filename="${filename}" data-loaded="false">
                 点击"查看额度"按钮加载额度信息...
@@ -1614,7 +1633,10 @@ async function verifyProjectId(filename) {
 
         if (response.ok && data.success) {
             // 成功时显示绿色成功消息和Project ID
-            const tierLine = data.subscription_tier ? `\nTier: ${data.subscription_tier}` : '';
+            // 优先使用原始 tier_name/tier_display，回退到 subscription_tier
+            const tierDisplayLabel = data.tier_display || data.tier_name || data.subscription_tier || '';
+            const tierIdLine = data.tier_id ? ` (原始: ${data.tier_id})` : '';
+            const tierLine = tierDisplayLabel ? `\nTier: ${tierDisplayLabel}${tierIdLine}` : '';
             const creditLine = data.credit_amount !== undefined && data.credit_amount !== null
                 ? `\n积分: ${data.credit_amount}`
                 : '';
@@ -1623,6 +1645,11 @@ async function verifyProjectId(filename) {
 
             // 弹出成功提示
             showMessageModal('检验成功', `✅ 检验成功！\n\n文件: ${filename}\nProject ID: ${data.project_id}${tierLine}${creditLine}\n\n${data.message}`, 'success');
+
+            // 同步更新该行 tier badge（geminicli 返回 tier_display）
+            if (data.tier_display || data.tier_id) {
+                updateTierBadge(filename, data.tier_display, data.tier_id, data.tier_name);
+            }
 
             await AppState.creds.refresh();
         } else {
@@ -1931,6 +1958,236 @@ async function toggleAntigravityQuotaDetails(pathId) {
         }
     }
 }
+
+// =====================================================================
+// geminicli 额度查询（retrieveUserQuota）
+// =====================================================================
+
+// 渲染 geminicli 额度条到指定容器
+function renderGeminicliQuota(contentDiv, filename, data) {
+    const quotas = data.quotas || [];
+    const tier = data.tier || {};
+
+    // 渲染 tier 信息头部
+    const tierName = tier.name || tier.display || '';
+    const tierId = tier.id || '';
+    const tierSource = tier.source || '';
+    const previewAccess = data.has_access_to_preview_model ? '✅ 有' : '❌ 无';
+    const projectId = data.project_id || '';
+
+    let headerHTML = `
+        <div style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; padding: 15px; border-radius: 8px 8px 0 0; margin: -10px -10px 15px -10px;">
+            <h4 style="margin: 0; font-size: 16px; display: flex; align-items: center; gap: 8px;">
+                <span style="font-size: 20px;">📊</span>
+                <span>额度信息详情</span>
+            </h4>
+            <div style="font-size: 12px; opacity: 0.9; margin-top: 5px;">文件: ${filename}</div>
+            <div style="font-size: 12px; opacity: 0.9; margin-top: 3px;">
+                Project: ${projectId}${tierName ? ` | Tier: ${tierName}${tierId && tierId !== tierName ? ` (${tierId})` : ''}${tierSource ? ` [${tierSource}]` : ''}` : ''} | Preview: ${previewAccess}
+            </div>
+        </div>
+    `;
+
+    if (quotas.length === 0) {
+        contentDiv.innerHTML = headerHTML + `
+            <div style="text-align: center; padding: 20px; color: #999;">
+                <div style="font-size: 48px; margin-bottom: 10px;">📊</div>
+                <div>暂无额度信息</div>
+            </div>
+        `;
+        return;
+    }
+
+    let quotaHTML = headerHTML + `
+        <div style="display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 10px;">
+    `;
+
+    for (const q of quotas) {
+        const modelId = q.model_id || '未知模型';
+        const remaining = q.remaining_amount != null ? q.remaining_amount : 0;
+        const limit = q.limit != null ? q.limit : 0;
+        const percentRemaining = q.percent_remaining != null ? q.percent_remaining : (limit > 0 ? Math.round(remaining / limit * 100) : 0);
+        const resetTime = q.reset_time || '';
+
+        // 根据剩余比例选色
+        let color = '#28a745'; // 绿
+        if (percentRemaining <= 10) color = '#dc3545'; // 红
+        else if (percentRemaining <= 30) color = '#ffc107'; // 黄
+        else if (percentRemaining <= 50) color = '#17a2b8'; // 蓝
+
+        const resetText = resetTime ? `🔄 重置: ${resetTime}` : '';
+        const limitText = limit > 0 ? `${remaining}/${limit}` : `${remaining}`;
+
+        quotaHTML += `
+            <div style="background: white; border-left: 4px solid ${color}; border-radius: 4px; padding: 8px 10px; box-shadow: 0 1px 3px rgba(0,0,0,0.1);">
+                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px;">
+                    <div style="font-weight: bold; color: #333; font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; margin-right: 8px;" title="${modelId}">
+                        ${modelId}
+                    </div>
+                    <div style="font-size: 13px; font-weight: bold; color: ${color}; white-space: nowrap;">
+                        ${percentRemaining}% <span style="font-size: 10px; color: #666; font-weight: normal;">(${limitText})</span>
+                    </div>
+                </div>
+                <div style="width: 100%; height: 8px; background-color: #e9ecef; border-radius: 4px; overflow: hidden; margin-bottom: 4px;">
+                    <div style="width: ${percentRemaining}%; height: 100%; background-color: ${color}; transition: width 0.3s ease;"></div>
+                </div>
+                <div style="font-size: 10px; color: #666; text-align: right;">
+                    ${resetText}
+                </div>
+            </div>
+        `;
+    }
+
+    quotaHTML += '</div>';
+    contentDiv.innerHTML = quotaHTML;
+}
+
+// 更新某凭证行的 tier badge（用 verify/quota 返回的 tier_display）
+function updateTierBadge(filename, tierDisplay, tierId, tierName) {
+    const badges = document.querySelectorAll(`.tier-badge[data-filename="${filename}"]`);
+    const td = (tierDisplay || '').toLowerCase();
+    let label, color;
+    switch (td) {
+        case 'ultra': label = 'ULTRA'; color = '#ff9800'; break;
+        case 'standard': label = 'Standard'; color = '#6f42c1'; break;
+        case 'enterprise': label = 'Enterprise'; color = '#4a148c'; break;
+        case 'legacy': label = 'Legacy'; color = '#607d8b'; break;
+        case 'free': label = 'FREE'; color = '#607d8b'; break;
+        case 'unknown': label = tierId || 'Unknown'; color = '#78909c'; break;
+        default: label = td.toUpperCase(); color = '#2e7d32';
+    }
+    const title = tierId ? `凭证等级: ${label} (原始: ${tierId})` : `凭证等级: ${label}`;
+    badges.forEach(b => {
+        b.style.backgroundColor = color;
+        b.textContent = `Tier: ${label}`;
+        b.setAttribute('title', title);
+    });
+}
+
+async function toggleGeminicliQuotaDetails(pathId) {
+    const quotaDetails = document.getElementById('quota-' + pathId);
+    if (!quotaDetails) return;
+
+    const isShowing = quotaDetails.style.display === 'block';
+
+    if (isShowing) {
+        quotaDetails.style.display = 'none';
+    } else {
+        quotaDetails.style.display = 'block';
+
+        const contentDiv = quotaDetails.querySelector('.cred-quota-content');
+        const filename = contentDiv.getAttribute('data-filename');
+
+        if (filename) {
+            contentDiv.innerHTML = '<div style="text-align: center; padding: 20px; color: #666;">📊 正在加载额度信息...</div>';
+
+            try {
+                const response = await fetch(`./creds/quota/${encodeURIComponent(filename)}?mode=geminicli`, {
+                    method: 'GET',
+                    headers: getAuthHeaders()
+                });
+                const data = await response.json();
+
+                if (response.ok && data.success) {
+                    renderGeminicliQuota(contentDiv, filename, data);
+                    // 同步更新该行 tier badge
+                    const tier = data.tier || {};
+                    if (tier.display || tier.id) {
+                        updateTierBadge(filename, tier.display, tier.id, tier.name);
+                    }
+                    showStatus('✅ 成功加载额度信息', 'success');
+                } else {
+                    const errorMsg = data.error || '获取额度信息失败';
+                    contentDiv.innerHTML = `
+                        <div style="text-align: center; padding: 20px; color: #dc3545;">
+                            <div style="font-size: 48px; margin-bottom: 10px;">❌</div>
+                            <div style="font-weight: bold; margin-bottom: 5px;">获取额度信息失败</div>
+                            <div style="font-size: 13px; color: #666;">${errorMsg}</div>
+                        </div>
+                    `;
+                    showStatus(`❌ ${errorMsg}`, 'error');
+                }
+            } catch (error) {
+                contentDiv.innerHTML = `
+                    <div style="text-align: center; padding: 20px; color: #dc3545;">
+                        <div style="font-size: 48px; margin-bottom: 10px;">❌</div>
+                        <div style="font-weight: bold; margin-bottom: 5px;">网络错误</div>
+                        <div style="font-size: 13px; color: #666;">${error.message}</div>
+                    </div>
+                `;
+                showStatus(`❌ 获取额度信息失败: ${error.message}`, 'error');
+            }
+        }
+    }
+}
+
+// 批量查询所有 geminicli 凭证额度
+async function batchQueryGeminicliQuota() {
+    // 收集当前列表中所有 geminicli 凭证文件名
+    const cards = document.querySelectorAll('#credsList .cred-card');
+    const filenames = [];
+    cards.forEach(card => {
+        const badge = card.querySelector('.tier-badge');
+        if (badge) {
+            const fn = badge.getAttribute('data-filename');
+            if (fn) filenames.push(fn);
+        }
+    });
+
+    if (filenames.length === 0) {
+        showStatus('❌ 当前没有可查询的凭证', 'error');
+        return;
+    }
+
+    showStatus(`📊 开始批量查询 ${filenames.length} 个凭证的额度...`, 'info');
+
+    try {
+        const response = await fetch('./creds/quota/batch?mode=geminicli', {
+            method: 'POST',
+            headers: getAuthHeaders(),
+            body: JSON.stringify({ filenames })
+        });
+        const data = await response.json();
+
+        if (response.ok) {
+            // 把每个结果回填到对应凭证行的额度容器
+            const results = data.results || [];
+            for (const r of results) {
+                if (!r.filename) continue;
+                const pathId = btoa(encodeURIComponent(r.filename)).replace(/[+/=]/g, '_');
+                const quotaDiv = document.getElementById('quota-' + pathId);
+                if (quotaDiv) {
+                    const contentDiv = quotaDiv.querySelector('.cred-quota-content');
+                    if (contentDiv) {
+                        if (r.success) {
+                            renderGeminicliQuota(contentDiv, r.filename, r);
+                            // 展开额度区域
+                            quotaDiv.style.display = 'block';
+                            // 更新 tier badge
+                            const tier = r.tier || {};
+                            if (tier.display || tier.id) {
+                                updateTierBadge(r.filename, tier.display, tier.id, tier.name);
+                            }
+                        } else {
+                            contentDiv.innerHTML = `
+                                <div style="text-align: center; padding: 15px; color: #dc3545; font-size: 13px;">
+                                    ❌ ${r.error || '查询失败'}
+                                </div>
+                            `;
+                            quotaDiv.style.display = 'block';
+                        }
+                    }
+                }
+            }
+            showStatus(`✅ 批量查询完成: 成功 ${data.success_count}/${data.total_count}`, 'success');
+        } else {
+            showStatus(`❌ 批量查询失败: ${data.detail || '未知错误'}`, 'error');
+        }
+    } catch (error) {
+        showStatus(`❌ 批量查询异常: ${error.message}`, 'error');
+    }
+}
+
 
 // =====================================================================
 // 查看报错详情

@@ -1705,7 +1705,7 @@
                 <div class="status info" style="margin-bottom: 20px;">
                     <strong>💡 检验功能说明：</strong>
                     <p style="margin: 10px 0;">
-                        点击每个凭证的"检验"按钮可以重新获取Project ID, 并查看账号的tier(free/pro/ultra)。<br>
+                        点击每个凭证的"检验"按钮可以重新获取Project ID, 并查看账号的tier(free/standard/pro/ultra/enterprise)。<br>
                         <strong style="color: #0c5460;">✅ 检验成功可以恢复403错误</strong>，让凭证重新正常工作。<br>
                         建议在遇到403错误时使用此功能。
                     </p>
@@ -1736,6 +1736,7 @@
                 <div class="manage-actions">
                     <button class="refresh-btn" onclick="refreshCredsStatus()">刷新状态</button>
                     <button class="download-all-btn" onclick="downloadAllCreds()">打包下载所有文件</button>
+                    <button class="batch-btn" onclick="batchQueryGeminicliQuota()" title="批量查询当前列表中所有凭证的额度（retrieveUserQuota）">查询所有凭证额度</button>
                 </div>
 
                 <!-- 批量操作控件 -->

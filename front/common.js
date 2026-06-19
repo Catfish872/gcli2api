@@ -60,6 +60,7 @@ function createCredsManager(type) {
         currentPreviewFilter: 'all',
         currentTierFilter: 'all',
         statsData: { total: 0, normal: 0, disabled: 0 },
+        quotaResults: new Map(),
 
         // API端点
         getEndpoint: (action) => {
@@ -2004,6 +2005,8 @@ function renderGeminicliQuota(contentDiv, filename, data) {
 
     for (const q of quotas) {
         const modelId = q.model_id || '未知模型';
+        const tokenType = q.token_type || '';
+        const displayName = tokenType ? `${modelId} · ${tokenType}` : modelId;
         const remaining = q.remaining_amount != null ? q.remaining_amount : 0;
         const limit = q.limit != null ? q.limit : 0;
         const percentRemaining = q.percent_remaining != null ? q.percent_remaining : (limit > 0 ? Math.round(remaining / limit * 100) : 0);
@@ -2021,8 +2024,8 @@ function renderGeminicliQuota(contentDiv, filename, data) {
         quotaHTML += `
             <div style="background: white; border-left: 4px solid ${color}; border-radius: 4px; padding: 8px 10px; box-shadow: 0 1px 3px rgba(0,0,0,0.1);">
                 <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px;">
-                    <div style="font-weight: bold; color: #333; font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; margin-right: 8px;" title="${modelId}">
-                        ${modelId}
+                    <div style="font-weight: bold; color: #333; font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; margin-right: 8px;" title="${displayName}">
+                        ${displayName}
                     </div>
                     <div style="font-size: 13px; font-weight: bold; color: ${color}; white-space: nowrap;">
                         ${percentRemaining}% <span style="font-size: 10px; color: #666; font-weight: normal;">(${limitText})</span>
@@ -2123,14 +2126,26 @@ async function toggleGeminicliQuotaDetails(pathId) {
 
 // 批量查询所有 geminicli 凭证额度
 async function batchQueryGeminicliQuota() {
-    // 收集当前列表中所有 geminicli 凭证文件名
     const cards = document.querySelectorAll('#credsList .cred-card');
     const filenames = [];
+    const targets = new Map();
+
     cards.forEach(card => {
         const badge = card.querySelector('.tier-badge');
-        if (badge) {
-            const fn = badge.getAttribute('data-filename');
-            if (fn) filenames.push(fn);
+        if (!badge) return;
+
+        const filename = badge.getAttribute('data-filename');
+        if (!filename) return;
+
+        const quotaDiv = card.querySelector('.cred-quota-details');
+        const contentDiv = quotaDiv ? quotaDiv.querySelector('.cred-quota-content') : null;
+
+        filenames.push(filename);
+
+        if (quotaDiv && contentDiv) {
+            targets.set(filename, { quotaDiv, contentDiv });
+            quotaDiv.style.display = 'block';
+            contentDiv.innerHTML = '<div style="text-align: center; padding: 20px; color: #666;">📊 正在查询额度信息...</div>';
         }
     });
 
@@ -2147,42 +2162,55 @@ async function batchQueryGeminicliQuota() {
             headers: getAuthHeaders(),
             body: JSON.stringify({ filenames })
         });
+
         const data = await response.json();
 
-        if (response.ok) {
-            // 把每个结果回填到对应凭证行的额度容器
-            const results = data.results || [];
-            for (const r of results) {
-                if (!r.filename) continue;
-                const pathId = btoa(encodeURIComponent(r.filename)).replace(/[+/=]/g, '_');
-                const quotaDiv = document.getElementById('quota-' + pathId);
-                if (quotaDiv) {
-                    const contentDiv = quotaDiv.querySelector('.cred-quota-content');
-                    if (contentDiv) {
-                        if (r.success) {
-                            renderGeminicliQuota(contentDiv, r.filename, r);
-                            // 展开额度区域
-                            quotaDiv.style.display = 'block';
-                            // 更新 tier badge
-                            const tier = r.tier || {};
-                            if (tier.display || tier.id) {
-                                updateTierBadge(r.filename, tier.display, tier.id, tier.name);
-                            }
-                        } else {
-                            contentDiv.innerHTML = `
-                                <div style="text-align: center; padding: 15px; color: #dc3545; font-size: 13px;">
-                                    ❌ ${r.error || '查询失败'}
-                                </div>
-                            `;
-                            quotaDiv.style.display = 'block';
-                        }
-                    }
-                }
-            }
-            showStatus(`✅ 批量查询完成: 成功 ${data.success_count}/${data.total_count}`, 'success');
-        } else {
+        if (!response.ok) {
             showStatus(`❌ 批量查询失败: ${data.detail || '未知错误'}`, 'error');
+            return;
         }
+
+        const results = data.results || [];
+        let renderedCount = 0;
+        let missingCount = 0;
+
+        for (const r of results) {
+            if (!r.filename) continue;
+
+            const target = targets.get(r.filename);
+            if (!target) {
+                missingCount += 1;
+                console.warn('[quota batch] 找不到前端额度容器:', r.filename, r);
+                continue;
+            }
+
+            const { quotaDiv, contentDiv } = target;
+
+            if (r.success) {
+                AppState.creds.quotaResults.set(r.filename, r);
+                renderGeminicliQuota(contentDiv, r.filename, r);
+                quotaDiv.style.display = 'block';
+
+                const tier = r.tier || {};
+                if (tier.display || tier.id) {
+                    updateTierBadge(r.filename, tier.display, tier.id, tier.name);
+                }
+
+                renderedCount += 1;
+            } else {
+                contentDiv.innerHTML = `
+                    <div style="text-align: center; padding: 15px; color: #dc3545; font-size: 13px;">
+                        ❌ ${r.error || '查询失败'}
+                    </div>
+                `;
+                quotaDiv.style.display = 'block';
+            }
+        }
+
+        showStatus(
+            `✅ 批量查询完成: 成功 ${data.success_count}/${data.total_count}，已显示 ${renderedCount} 个额度结果${missingCount ? `，${missingCount} 个未找到界面容器` : ''}`,
+            'success'
+        );
     } catch (error) {
         showStatus(`❌ 批量查询异常: ${error.message}`, 'error');
     }

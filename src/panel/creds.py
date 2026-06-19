@@ -565,7 +565,8 @@ async def verify_credential_project_common(filename: str, mode: str = "geminicli
         api_base_url = await get_code_assist_endpoint()
         user_agent = GEMINICLI_USER_AGENT
 
-    # 重新获取project id（仅 antigravity 模式请求积分）
+    # 重新获取project id + tier（geminicli 用 detailed 拿原始 tier 信息回传前端）
+    tier_details: dict = {}
     if mode == "antigravity":
         project_id, subscription_tier, credit_amount = await fetch_project_id_and_tier(
             access_token=credentials.access_token,
@@ -574,10 +575,12 @@ async def verify_credential_project_common(filename: str, mode: str = "geminicli
             include_credits=True,
         )
     else:
-        project_id, subscription_tier = await fetch_project_id_and_tier(
+        project_id, subscription_tier, _credit, tier_details = await fetch_project_id_and_tier(
             access_token=credentials.access_token,
             user_agent=user_agent,
             api_base_url=api_base_url,
+            include_credits=True,
+            detailed=True,
         )
         credit_amount = None
 
@@ -593,7 +596,7 @@ async def verify_credential_project_common(filename: str, mode: str = "geminicli
             "error_codes": []
         }
 
-        # 同步更新状态表中的 tier 字段
+        # 同步更新状态表中的 tier 字段（保持 free/pro/ultra 规范化类别，轮询零影响）
         state_update["tier"] = subscription_tier
 
         # 如果是 geminicli 模式，直接设置 preview=True
@@ -611,6 +614,13 @@ async def verify_credential_project_common(filename: str, mode: str = "geminicli
             "subscription_tier": subscription_tier,
             "message": "检验成功！Project ID已更新，已解除禁用状态并清除错误码，403错误应该已恢复"
         }
+
+        # geminicli 模式回传原始 tier 信息（不落库，仅前端展示）
+        if mode == "geminicli" and tier_details:
+            response_data["tier_id"] = tier_details.get("tier_id")
+            response_data["tier_name"] = tier_details.get("tier_name")
+            response_data["tier_display"] = tier_details.get("tier_display")
+            response_data["tier_source"] = tier_details.get("tier_source")
 
         if mode == "antigravity" and credit_amount is not None:
             response_data["credit_amount"] = credit_amount
@@ -1144,6 +1154,99 @@ async def get_credential_errors(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+async def fetch_geminicli_quota_common(
+    storage_adapter,
+    filename: str,
+) -> dict:
+    """
+    查询单个 geminicli 凭证的额度信息（retrieveUserQuota + loadCodeAssist tier）。
+    返回结构化结果，不抛异常（异常捕获后返回 success=False）。
+    """
+    try:
+        credential_data = await storage_adapter.get_credential(filename, mode="geminicli")
+        if not credential_data:
+            return {"success": False, "filename": filename, "error": "凭证不存在"}
+
+        from src.google_oauth_api import Credentials, fetch_project_id_and_tier, retrieve_user_quota
+
+        creds = Credentials.from_dict(credential_data)
+        token_refreshed = await creds.refresh_if_needed()
+        if token_refreshed:
+            log.info(f"[geminicli quota] Token已自动刷新: {filename}")
+            credential_data = creds.to_dict()
+            await storage_adapter.store_credential(filename, credential_data, mode="geminicli")
+
+        access_token = credential_data.get("access_token") or credential_data.get("token")
+        if not access_token:
+            return {"success": False, "filename": filename, "error": "凭证中没有访问令牌"}
+
+        api_base_url = await get_code_assist_endpoint()
+        user_agent = GEMINICLI_USER_AGENT
+
+        # 确保 project_id；没有则先 loadCodeAssist 获取
+        project_id = credential_data.get("project_id", "")
+        tier_details: dict = {}
+        if not project_id:
+            project_id, _tier_category, _credit, tier_details = await fetch_project_id_and_tier(
+                access_token=access_token,
+                user_agent=user_agent,
+                api_base_url=api_base_url,
+                include_credits=True,
+                detailed=True,
+            )
+            if project_id:
+                credential_data["project_id"] = project_id
+                await storage_adapter.store_credential(filename, credential_data, mode="geminicli")
+        else:
+            # 有 project_id 也调一次 detailed 拿 tier 信息
+            try:
+                _pid, _tc, _cred, tier_details = await fetch_project_id_and_tier(
+                    access_token=access_token,
+                    user_agent=user_agent,
+                    api_base_url=api_base_url,
+                    include_credits=True,
+                    detailed=True,
+                )
+            except Exception as te:
+                log.warning(f"[geminicli quota] loadCodeAssist 获取 tier 失败 {filename}: {te}")
+                tier_details = {}
+
+        if not project_id:
+            return {"success": False, "filename": filename, "error": "无法获取 project_id，请先检验凭证"}
+
+        # 查询额度
+        quota_result = await retrieve_user_quota(
+            access_token=access_token,
+            user_agent=user_agent,
+            api_base_url=api_base_url,
+            project_id=project_id,
+        )
+
+        tier_info = {
+            "id": tier_details.get("tier_id"),
+            "name": tier_details.get("tier_name"),
+            "display": tier_details.get("tier_display"),
+            "source": tier_details.get("tier_source"),
+        }
+
+        return {
+            "success": quota_result.get("success", False),
+            "filename": filename,
+            "project_id": project_id,
+            "tier": tier_info,
+            "quotas": quota_result.get("quotas", []),
+            "has_access_to_preview_model": quota_result.get("has_access_to_preview_model", False),
+            "error": quota_result.get("error") if not quota_result.get("success") else None,
+            "raw": {
+                "loadCodeAssist": tier_details.get("raw", {}),
+                "retrieveUserQuota": quota_result.get("raw", {}),
+            },
+        }
+    except Exception as e:
+        log.error(f"[geminicli quota] 查询额度失败 {filename}: {e}")
+        return {"success": False, "filename": filename, "error": f"{type(e).__name__}: {e}"}
+
+
 @router.get("/quota/{filename}")
 async def get_credential_quota(
     filename: str,
@@ -1151,14 +1254,15 @@ async def get_credential_quota(
     mode: str = "antigravity"
 ):
     """
-    获取指定凭证的额度信息（仅支持 antigravity 模式）
+    获取指定凭证的额度信息
+    - antigravity 模式：走 fetchAvailableModels
+    - geminicli 模式：走 retrieveUserQuota + loadCodeAssist tier
     """
     try:
         mode = validate_mode(mode)
         # 验证文件名
         if not filename.endswith(".json"):
             raise HTTPException(status_code=400, detail="无效的文件名")
-
 
         storage_adapter = await get_storage_adapter()
 
@@ -1187,7 +1291,18 @@ async def get_credential_quota(
         if not access_token:
             raise HTTPException(status_code=400, detail="凭证中没有访问令牌")
 
-        # 获取额度信息
+        if mode == "geminicli":
+            # geminicli 模式：走 retrieveUserQuota
+            result = await fetch_geminicli_quota_common(storage_adapter, filename)
+            if result.get("success"):
+                return JSONResponse(content=result)
+            else:
+                return JSONResponse(
+                    status_code=400,
+                    content=result
+                )
+
+        # antigravity 模式：走 fetchAvailableModels
         quota_info = await fetch_quota_info(access_token)
 
         if quota_info.get("success"):
@@ -1211,6 +1326,61 @@ async def get_credential_quota(
     except Exception as e:
         log.error(f"获取凭证额度失败 {filename}: {e}")
         raise HTTPException(status_code=500, detail=f"获取额度失败: {str(e)}")
+
+
+@router.post("/quota/batch")
+async def batch_get_credential_quota(
+    request: dict,
+    token: str = Depends(verify_panel_token),
+    mode: str = "geminicli"
+):
+    """
+    批量查询多个凭证的额度信息（仅支持 geminicli 模式）。
+    请求体: { "filenames": ["a.json", "b.json", ...] }
+    """
+    try:
+        mode = validate_mode(mode)
+        if mode != "geminicli":
+            raise HTTPException(status_code=400, detail="批量额度查询仅支持 geminicli 模式")
+
+        filenames = request.get("filenames") if isinstance(request, dict) else None
+        if not filenames or not isinstance(filenames, list):
+            raise HTTPException(status_code=400, detail="请提供 filenames 列表")
+
+        storage_adapter = await get_storage_adapter()
+
+        # 并发查询，限制并发数避免对 Google API 造成过大压力
+        sem = asyncio.Semaphore(5)
+
+        async def query_one(fn: str) -> dict:
+            async with sem:
+                return await fetch_geminicli_quota_common(storage_adapter, fn)
+
+        results = await asyncio.gather(*[query_one(fn) for fn in filenames], return_exceptions=True)
+
+        summary = []
+        success_count = 0
+        for idx, fn in enumerate(filenames):
+            r = results[idx]
+            if isinstance(r, Exception):
+                summary.append({"success": False, "filename": fn, "error": str(r)})
+            else:
+                summary.append(r)
+                if r.get("success"):
+                    success_count += 1
+
+        return JSONResponse(content={
+            "success_count": success_count,
+            "total_count": len(filenames),
+            "results": summary,
+            "message": f"批量额度查询完成: 成功 {success_count}/{len(filenames)}",
+        })
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        log.error(f"批量查询凭证额度失败: {e}")
+        raise HTTPException(status_code=500, detail=f"批量查询失败: {str(e)}")
 
 
 @router.post("/configure-preview/{filename}")

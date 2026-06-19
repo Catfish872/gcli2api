@@ -730,7 +730,7 @@ function createCredCard(credInfo, manager) {
         <button class="cred-btn download" onclick="download${managerType === 'antigravity' ? 'Antigravity' : ''}Cred('${filename}')">下载</button>
         <button class="cred-btn email" onclick="fetch${managerType === 'antigravity' ? 'Antigravity' : ''}UserEmail('${filename}')">查看账号邮箱</button>
         ${managerType === 'antigravity' ? `<button class="cred-btn" onclick="toggleAntigravityQuotaDetails('${pathId}')" title="查看该凭证的额度信息">查看额度</button>` : ''}
-        ${managerType === 'geminicli' ? `<button class="cred-btn" onclick="toggleGeminicliQuotaDetails('${pathId}')" title="查看该凭证的额度信息（geminicli）">查看额度</button>` : ''}
+        ${managerType !== 'antigravity' ? `<button class="cred-btn" onclick="toggleGeminicliQuotaDetails('${pathId}')" title="查看该凭证的额度信息（geminicli）">查看额度</button>` : ''}
         ${managerType === 'antigravity' ? (credInfo.enable_credit
             ? `<button class="cred-btn" data-filename="${filename}" data-action="disable_credit" title="关闭该凭证的Credit模式">关闭 Credit</button>`
             : `<button class="cred-btn" data-filename="${filename}" data-action="enable_credit" title="开启该凭证的Credit模式">开启 Credit</button>`
@@ -774,7 +774,7 @@ function createCredCard(credInfo, manager) {
             </div>
         </div>
         ` : ''}
-        ${managerType === 'geminicli' ? `
+        ${managerType !== 'antigravity' ? `
         <div class="cred-quota-details" id="quota-${pathId}" style="display: none;">
             <div class="cred-quota-content" data-filename="${filename}" data-loaded="false">
                 点击"查看额度"按钮加载额度信息...

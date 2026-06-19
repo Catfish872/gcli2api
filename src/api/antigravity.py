@@ -23,6 +23,7 @@ from src.credential_manager import credential_manager
 from src.httpx_client import stream_post_async, post_async
 from src.models import Model, model_to_dict
 from src.utils import ANTIGRAVITY_USER_AGENT
+from src.usage_stats_v2 import safe_record_usage_call
 
 # 导入共同的基础功能
 from src.api.utils import (
@@ -416,6 +417,7 @@ async def stream_request(
                             cooldown_until, mode="antigravity", model_name=model_name,
                             error_message=error_body
                         )
+                        safe_record_usage_call("antigravity", model_name, False, status_code)
 
                         # 检查是否应该重试
                         should_retry = await handle_error_with_retry(
@@ -440,6 +442,7 @@ async def stream_request(
                             None, mode="antigravity", model_name=model_name,
                             error_message=error_body
                         )
+                        safe_record_usage_call("antigravity", model_name, False, status_code)
                         yield chunk
                         return
                 else:
@@ -449,6 +452,7 @@ async def stream_request(
                         await record_api_call_success(
                             credential_manager, current_file, mode="antigravity", model_name=model_name
                         )
+                        safe_record_usage_call("antigravity", model_name, True, 200)
                         success_recorded = True
                         log.debug(f"[ANTIGRAVITY STREAM] 开始接收流式响应，模型: {model_name}")
 
@@ -472,6 +476,7 @@ async def stream_request(
                     None, mode="antigravity", model_name=model_name,
                     error_message="Empty response from API"
                 )
+                safe_record_usage_call("antigravity", model_name, False, 200)
                 
                 if attempt < max_retries:
                     need_retry = True
@@ -691,6 +696,7 @@ async def non_stream_request(
                         None, mode="antigravity", model_name=model_name,
                         error_message="Empty response from API"
                     )
+                    safe_record_usage_call("antigravity", model_name, False, 200)
                     
                     if attempt < max_retries:
                         need_retry = True
@@ -706,6 +712,7 @@ async def non_stream_request(
                     await record_api_call_success(
                         credential_manager, current_file, mode="antigravity", model_name=model_name
                     )
+                    safe_record_usage_call("antigravity", model_name, True, 200)
                     return Response(
                         content=response.content,
                         status_code=200,
@@ -758,6 +765,7 @@ async def non_stream_request(
                         cooldown_until, mode="antigravity", model_name=model_name,
                         error_message=error_text
                     )
+                    safe_record_usage_call("antigravity", model_name, False, status_code)
 
                     # 检查是否应该重试
                     should_retry = await handle_error_with_retry(
@@ -780,6 +788,7 @@ async def non_stream_request(
                         None, mode="antigravity", model_name=model_name,
                         error_message=error_text
                     )
+                    safe_record_usage_call("antigravity", model_name, False, status_code)
                     return last_error_response
             
             # 统一处理重试

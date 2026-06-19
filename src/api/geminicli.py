@@ -33,6 +33,7 @@ from src.api.utils import (
     parse_and_log_cooldown,
 )
 from src.utils import get_geminicli_user_agent
+from src.usage_stats_v2 import safe_record_usage_call
 
 # ==================== 全局凭证管理器 ====================
 
@@ -263,6 +264,7 @@ async def stream_request(
                             cooldown_until, mode="geminicli", model_name=model_name,
                             error_message=error_body
                         )
+                        safe_record_usage_call("geminicli", model_name, False, status_code)
 
                         # 检查是否应该重试
                         should_retry = await handle_error_with_retry(
@@ -287,6 +289,7 @@ async def stream_request(
                             None, mode="geminicli", model_name=model_name,
                             error_message=error_body
                         )
+                        safe_record_usage_call("geminicli", model_name, False, status_code)
                         yield chunk
                         return
                 else:
@@ -296,6 +299,7 @@ async def stream_request(
                         await record_api_call_success(
                             credential_manager, current_file, mode="geminicli", model_name=model_name
                         )
+                        safe_record_usage_call("geminicli", model_name, True, 200)
                         success_recorded = True
                         log.debug(f"[GEMINICLI STREAM] 开始接收流式响应，模型: {model_name}")
 
@@ -483,6 +487,7 @@ async def non_stream_request(
                 await record_api_call_success(
                     credential_manager, current_file, mode="geminicli", model_name=model_name
                 )
+                safe_record_usage_call("geminicli", model_name, True, 200)
                 # 创建响应头,移除压缩相关的header避免重复解压
                 response_headers = dict(response.headers)
                 response_headers.pop('content-encoding', None)
@@ -540,6 +545,7 @@ async def non_stream_request(
                     cooldown_until, mode="geminicli", model_name=model_name,
                     error_message=error_text
                 )
+                safe_record_usage_call("geminicli", model_name, False, status_code)
 
                 # 检查是否应该重试（会自动处理禁用逻辑）
                 should_retry = await handle_error_with_retry(
@@ -579,6 +585,7 @@ async def non_stream_request(
                     None, mode="geminicli", model_name=model_name,
                     error_message=error_text
                 )
+                safe_record_usage_call("geminicli", model_name, False, status_code)
                 return last_error_response
 
         except Exception as e:

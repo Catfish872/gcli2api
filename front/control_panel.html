@@ -1384,6 +1384,7 @@
                 <button class="tab" onclick="switchTab('antigravity-manage')">Antigravity凭证管理</button>
                 <button class="tab" onclick="switchTab('config')">配置管理</button>
                 <button class="tab" onclick="switchTab('logs')">实时日志</button>
+                <button class="tab" onclick="switchTab('usage')">调用统计</button>
                 <button class="tab" onclick="switchTab('about')">项目信息</button>
             </div>
 
@@ -2320,6 +2321,90 @@
                     style="background-color: #1e1e1e; color: #ffffff; font-family: 'Courier New', monospace; font-size: 12px; height: 600px; overflow-y: auto; border: 1px solid #333; border-radius: 5px; padding: 15px; white-space: pre-wrap; word-break: break-all;">
                     <div id="logContent">等待连接日志流...</div>
                 </div>
+            </div>
+
+            <!-- 调用统计标签页 -->
+            <div id="usageTab" class="tab-content">
+                <h3>调用统计</h3>
+                <p>按真实后端模型统计调用情况（今日 / 7 天 / 30 天）</p>
+
+                <!-- 控制栏 -->
+                <div class="manage-actions" style="flex-wrap: wrap; gap: 8px; align-items: center;">
+                    <div class="filter-container" style="margin: 0;">
+                        <label>范围：</label>
+                        <select id="usageRangeSelect" class="filter-select" onchange="onUsageRangeChange()">
+                            <option value="1d">今日</option>
+                            <option value="7d" selected>最近 7 天</option>
+                            <option value="30d">最近 30 天</option>
+                        </select>
+                        <label style="margin-left: 12px;">模式：</label>
+                        <select id="usageModeSelect" class="filter-select" onchange="onUsageModeChange()">
+                            <option value="all" selected>全部</option>
+                            <option value="geminicli">Geminicli</option>
+                            <option value="antigravity">Antigravity</option>
+                        </select>
+                    </div>
+                    <button class="refresh-btn" onclick="refreshUsageStats()">刷新</button>
+                    <button class="btn" onclick="resetUsageStatsConfirm()">重置</button>
+                </div>
+
+                <!-- 汇总卡片 -->
+                <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; margin: 16px 0;">
+                    <div class="usage-info-item">
+                        <span class="usage-info-label">总调用</span>
+                        <span class="usage-info-value" id="usageTotal" style="font-size: 22px; font-weight: bold; color: #007bff;">0</span>
+                    </div>
+                    <div class="usage-info-item">
+                        <span class="usage-info-label">成功</span>
+                        <span class="usage-info-value" id="usageSuccess" style="font-size: 22px; font-weight: bold; color: #28a745;">0</span>
+                    </div>
+                    <div class="usage-info-item">
+                        <span class="usage-info-label">失败</span>
+                        <span class="usage-info-value" id="usageFailure" style="font-size: 22px; font-weight: bold; color: #dc3545;">0</span>
+                    </div>
+                    <div class="usage-info-item">
+                        <span class="usage-info-label">失败率</span>
+                        <span class="usage-info-value" id="usageFailureRate" style="font-size: 22px; font-weight: bold; color: #ffc107;">0%</span>
+                    </div>
+                    <div class="usage-info-item">
+                        <span class="usage-info-label">模型数量</span>
+                        <span class="usage-info-value" id="usageModelCount" style="font-size: 22px; font-weight: bold; color: #17a2b8;">0</span>
+                    </div>
+                </div>
+
+                <!-- 图表容器 -->
+                <div style="background-color: #ffffff; border: 1px solid #e0e0e0; border-radius: 8px; padding: 16px; margin-bottom: 16px;">
+                    <h4 style="margin-top: 0; color: #495057;">每日调用量</h4>
+                    <div id="usageChart" style="width: 100%; overflow-x: auto;"></div>
+                </div>
+
+                <!-- 模型明细表 -->
+                <div style="background-color: #ffffff; border: 1px solid #e0e0e0; border-radius: 8px; padding: 16px;">
+                    <h4 style="margin-top: 0; color: #495057;">模型明细</h4>
+                    <div style="overflow-x: auto;">
+                        <table id="usageModelsTable" style="width: 100%; border-collapse: collapse; font-size: 13px;">
+                            <thead>
+                                <tr style="background-color: #f8f9fa; text-align: left;">
+                                    <th style="padding: 8px; border-bottom: 2px solid #dee2e6;">模型</th>
+                                    <th style="padding: 8px; border-bottom: 2px solid #dee2e6;">成功</th>
+                                    <th style="padding: 8px; border-bottom: 2px solid #dee2e6;">失败</th>
+                                    <th style="padding: 8px; border-bottom: 2px solid #dee2e6;">总次数</th>
+                                    <th style="padding: 8px; border-bottom: 2px solid #dee2e6;">失败率</th>
+                                    <th style="padding: 8px; border-bottom: 2px solid #dee2e6;">最近调用</th>
+                                    <th style="padding: 8px; border-bottom: 2px solid #dee2e6;">状态码分布</th>
+                                </tr>
+                            </thead>
+                            <tbody id="usageModelsTableBody"></tbody>
+                        </table>
+                    </div>
+                </div>
+
+                <!-- 兼容旧 JS 的隐藏元素（避免旧缓存页面报错） -->
+                <div id="usageLoading" style="display:none;"></div>
+                <div id="usageList" style="display:none;"></div>
+                <span id="totalApiCalls" style="display:none;">0</span>
+                <span id="totalFiles" style="display:none;">0</span>
+                <span id="avgCallsPerFile" style="display:none;">0</span>
             </div>
 
             <!-- 项目信息标签页 -->

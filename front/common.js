@@ -35,6 +35,11 @@ const AppState = {
 
     // 使用统计
     usageStatsData: {},
+    usageRange: '7d',
+    usageMode: 'all',
+    usageSummaryData: null,
+    usageTimeseriesData: null,
+    usageModelsData: [],
 
     // 冷却倒计时
     cooldownTimerInterval: null
@@ -1058,6 +1063,7 @@ function triggerTabDataLoad(tabName) {
     if (tabName === 'antigravity-manage') AppState.antigravityCreds.refresh();
     if (tabName === 'config') loadConfig();
     if (tabName === 'logs') connectWebSocket();
+    if (tabName === 'usage') refreshUsageStats();
 }
 
 
@@ -3174,128 +3180,326 @@ function restoreOfficialUrls() {
 // =====================================================================
 // 使用统计
 // =====================================================================
+// 范围切换
+function onUsageRangeChange() {
+    const sel = document.getElementById('usageRangeSelect');
+    if (!sel) return;
+    AppState.usageRange = sel.value || '7d';
+    refreshUsageStats();
+}
+
+// 模式切换
+function onUsageModeChange() {
+    const sel = document.getElementById('usageModeSelect');
+    if (!sel) return;
+    AppState.usageMode = sel.value || 'all';
+    refreshUsageStats();
+}
+
+// 简易 HTML 转义，防止模型名/状态码注入
+function _usageEscapeHtml(str) {
+    if (str === null || str === undefined) return '';
+    var ampar = String.fromCharCode(38) + 'amp;';
+    var lt = String.fromCharCode(38) + 'lt;';
+    var gt = String.fromCharCode(38) + 'gt;';
+    var quot = String.fromCharCode(38) + 'quot;';
+    var apos = String.fromCharCode(38) + '#39;';
+    return String(str)
+        .replace(/&/g, ampar)
+        .replace(/</g, lt)
+        .replace(/>/g, gt)
+        .replace(/"/g, quot)
+        .replace(new RegExp(String.fromCharCode(39), 'g'), apos);
+}
+
+// 格式化时间戳为可读时间
+function _usageFormatTime(ts) {
+    if (!ts) return '—';
+    try {
+        const d = new Date(ts * 1000);
+        return d.toLocaleString('zh-CN', { hour12: false });
+    } catch (e) {
+        return String(ts);
+    }
+}
+
+// 主刷新函数（接入新接口，同时兼容旧元素）
 async function refreshUsageStats() {
+    const range = AppState.usageRange || '7d';
+    const mode = AppState.usageMode || 'all';
+    const params = `range=${encodeURIComponent(range)}&mode=${encodeURIComponent(mode)}`;
+
+    // 兼容旧元素（可能不存在，安全跳过）
     const loading = document.getElementById('usageLoading');
-    const list = document.getElementById('usageList');
 
     try {
-        loading.style.display = 'block';
-        list.innerHTML = '';
+        if (loading) loading.style.display = 'block';
 
-        const [statsResponse, aggregatedResponse] = await Promise.all([
-            fetch('./usage/stats', { headers: getAuthHeaders() }),
-            fetch('./usage/aggregated', { headers: getAuthHeaders() })
+        // 并行请求汇总、时间序列、模型明细
+        const [summaryRes, timeseriesRes, modelsRes] = await Promise.all([
+            fetch(`./usage/summary?${params}`, { headers: getAuthHeaders() }),
+            fetch(`./usage/timeseries?${params}`, { headers: getAuthHeaders() }),
+            fetch(`./usage/models?${params}`, { headers: getAuthHeaders() }),
         ]);
 
-        if (statsResponse.status === 401 || aggregatedResponse.status === 401) {
+        // 认证失败处理
+        if (summaryRes.status === 401 || timeseriesRes.status === 401 || modelsRes.status === 401) {
             showStatus('认证失败，请重新登录', 'error');
             setTimeout(() => location.reload(), 1500);
             return;
         }
 
-        const statsData = await statsResponse.json();
-        const aggregatedData = await aggregatedResponse.json();
+        const summaryData = await summaryRes.json();
+        const timeseriesData = await timeseriesRes.json();
+        const modelsData = await modelsRes.json();
 
-        if (statsResponse.ok && aggregatedResponse.ok) {
-            AppState.usageStatsData = statsData.success ? statsData.data : statsData;
+        const summary = (summaryData.success && summaryData.data) ? summaryData.data : {
+            total_calls: 0, success_calls: 0, failure_calls: 0, failure_rate: 0, model_count: 0
+        };
+        const timeseries = (timeseriesData.success && timeseriesData.data) ? timeseriesData.data : { dates: [], models: [], series: [] };
+        const models = (modelsData.success && modelsData.data) ? modelsData.data : [];
 
-            const aggData = aggregatedData.success ? aggregatedData.data : aggregatedData;
-            document.getElementById('totalApiCalls').textContent = aggData.total_calls_24h || 0;
-            document.getElementById('totalFiles').textContent = aggData.total_files || 0;
-            document.getElementById('avgCallsPerFile').textContent = (aggData.avg_calls_per_file || 0).toFixed(1);
+        AppState.usageSummaryData = summary;
+        AppState.usageTimeseriesData = timeseries;
+        AppState.usageModelsData = models;
+        // 旧字段兼容
+        AppState.usageStatsData = {};
+        for (const m of models) {
+            AppState.usageStatsData[m.model] = {
+                success_calls: m.success_calls,
+                failure_calls: m.failure_calls,
+                total_calls: m.total_calls,
+            };
+        }
 
-            renderUsageList();
+        // 渲染汇总卡片
+        const setText = (id, val) => {
+            const el = document.getElementById(id);
+            if (el) el.textContent = val;
+        };
+        setText('usageTotal', summary.total_calls || 0);
+        setText('usageSuccess', summary.success_calls || 0);
+        setText('usageFailure', summary.failure_calls || 0);
+        setText('usageFailureRate', (summary.failure_rate || 0) + '%');
+        setText('usageModelCount', summary.model_count || 0);
 
-            showStatus(`已加载 ${aggData.total_files || Object.keys(AppState.usageStatsData).length} 个文件的使用统计`, 'success');
-        } else {
-            const errorMsg = statsData.detail || aggregatedData.detail || '加载使用统计失败';
-            showStatus(`错误: ${errorMsg}`, 'error');
+        // 旧元素兼容
+        setText('totalApiCalls', summary.total_calls || 0);
+        setText('totalFiles', summary.model_count || 0);
+        setText('avgCallsPerFile',
+            summary.model_count > 0
+                ? ((summary.total_calls || 0) / summary.model_count).toFixed(1)
+                : '0'
+        );
+
+        // 渲染图表与明细表
+        renderUsageChart(timeseries);
+        renderUsageModelsTable(models);
+
+        if (typeof showStatus === 'function') {
+            showStatus(`已加载调用统计（${range} / ${mode}），共 ${summary.model_count || 0} 个模型`, 'success');
         }
     } catch (error) {
-        showStatus(`网络错误: ${error.message}`, 'error');
+        if (typeof showStatus === 'function') {
+            showStatus(`网络错误: ${error.message}`, 'error');
+        }
     } finally {
-        loading.style.display = 'none';
+        if (loading) loading.style.display = 'none';
     }
 }
 
-function renderUsageList() {
-    const list = document.getElementById('usageList');
-    list.innerHTML = '';
+// 渲染柱状图（原生 SVG，每柱=一天总调用量，tooltip 显示该天各模型详情）
+function renderUsageChart(timeseries) {
+    const container = document.getElementById('usageChart');
+    if (!container) return;
 
-    if (Object.keys(AppState.usageStatsData).length === 0) {
-        list.innerHTML = '<p style="text-align: center; color: #666;">暂无使用统计数据</p>';
+    const dates = timeseries.dates || [];
+    const models = timeseries.models || [];
+    const series = timeseries.series || [];
+
+    if (dates.length === 0 || series.length === 0) {
+        container.innerHTML = '<p style="text-align:center;color:#999;padding:20px;">暂无调用数据</p>';
         return;
     }
 
-    for (const [filename, stats] of Object.entries(AppState.usageStatsData)) {
-        const card = document.createElement('div');
-        card.className = 'usage-card';
-
-        const calls24h = stats.calls_24h || 0;
-
-        card.innerHTML = `
-            <div class="usage-header">
-                <div class="usage-filename">${filename}</div>
-            </div>
-            <div class="usage-info">
-                <div class="usage-info-item" style="grid-column: 1 / -1;">
-                    <span class="usage-info-label">24小时内调用次数</span>
-                    <span class="usage-info-value" style="font-size: 24px; font-weight: bold; color: #007bff;">${calls24h}</span>
-                </div>
-            </div>
-            <div class="usage-actions">
-                <button class="usage-btn reset" onclick="resetSingleUsageStats('${filename}')">重置统计</button>
-            </div>
-        `;
-
-        list.appendChild(card);
+    // 按日期聚合每天总调用与各模型明细
+    const dayMap = {};
+    for (const d of dates) {
+        dayMap[d] = { total: 0, success: 0, failure: 0, models: {} };
     }
-}
-
-async function resetSingleUsageStats(filename) {
-    if (!confirm(`确定要重置 ${filename} 的使用统计吗？`)) return;
-
-    try {
-        const response = await fetch('./usage/reset', {
-            method: 'POST',
-            headers: getAuthHeaders(),
-            body: JSON.stringify({ filename })
-        });
-
-        const data = await response.json();
-
-        if (response.ok && data.success) {
-            showStatus(data.message, 'success');
-            await refreshUsageStats();
-        } else {
-            showStatus(`重置失败: ${data.message || data.detail || data.error || '未知错误'}`, 'error');
+    for (const p of series) {
+        const dk = p.date_key;
+        if (!dayMap[dk]) continue;
+        const t = (p.total_calls || 0);
+        dayMap[dk].total += t;
+        dayMap[dk].success += (p.success_calls || 0);
+        dayMap[dk].failure += (p.failure_calls || 0);
+        if (t > 0 && p.model) {
+            dayMap[dk].models[p.model] = {
+                success: p.success_calls || 0,
+                failure: p.failure_calls || 0,
+                total: t,
+                failure_rate: p.failure_rate || 0,
+                status_codes: p.status_codes || {},
+            };
         }
-    } catch (error) {
-        showStatus(`网络错误: ${error.message}`, 'error');
     }
+
+    // 取调用量最高的前 8 个模型（用于 tooltip 主展示），其余合并"其他"
+    const modelTotals = {};
+    for (const p of series) {
+        modelTotals[p.model] = (modelTotals[p.model] || 0) + (p.total_calls || 0);
+    }
+    const topModels = Object.keys(modelTotals)
+        .sort((a, b) => modelTotals[b] - modelTotals[a])
+        .slice(0, 8);
+
+    const maxTotal = Math.max(1, ...dates.map(d => dayMap[d].total));
+    const chartWidth = Math.max(600, dates.length * 60);
+    const chartHeight = 240;
+    const barWidth = Math.max(20, Math.floor(chartWidth / dates.length) - 12);
+    const leftPad = 40;
+    const bottomPad = 40;
+    const topPad = 20;
+    const plotHeight = chartHeight - bottomPad - topPad;
+
+    let svg = `<svg width="100%" height="${chartHeight}" viewBox="0 0 ${chartWidth} ${chartHeight}" preserveAspectRatio="xMidYMid meet" style="display:block;">`;
+
+    // Y 轴参考线
+    for (let i = 0; i <= 4; i++) {
+        const y = topPad + (plotHeight / 4) * i;
+        const val = Math.round(maxTotal - (maxTotal / 4) * i);
+        svg += `<line x1="${leftPad}" y1="${y}" x2="${chartWidth - 10}" y2="${y}" stroke="#eee" stroke-width="1"/>`;
+        svg += `<text x="${leftPad - 6}" y="${y + 4}" font-size="10" fill="#999" text-anchor="end">${val}</text>`;
+    }
+
+    // 柱子
+    dates.forEach((d, idx) => {
+        const info = dayMap[d];
+        const h = (info.total / maxTotal) * plotHeight;
+        const x = leftPad + idx * (barWidth + 12) + 6;
+        const y = topPad + plotHeight - h;
+        const shortDate = d.slice(5); // MM-DD
+
+        // 构建 tooltip 内容（各模型 + 状态码）
+        const modelEntries = Object.entries(info.models).sort((a, b) => b[1].total - a[1].total);
+        let shown = modelEntries.slice(0, 8);
+        let others = modelEntries.slice(8);
+        let othersTotal = others.reduce((s, e) => s + e[1].total, 0);
+
+        let tipLines = [];
+        tipLines.push(`日期: ${d}`);
+        tipLines.push(`总次数: ${info.total}`);
+        tipLines.push(`成功: ${info.success}  失败: ${info.failure}`);
+        if (info.total > 0) {
+            tipLines.push(`失败率: ${(info.failure / info.total * 100).toFixed(1)}%`);
+        }
+        // 主要状态码
+        const codeMap = {};
+        for (const [, m] of modelEntries) {
+            for (const [code, cnt] of Object.entries(m.status_codes || {})) {
+                codeMap[code] = (codeMap[code] || 0) + cnt;
+            }
+        }
+        const topCodes = Object.entries(codeMap).sort((a, b) => b[1] - a[1]).slice(0, 5);
+        if (topCodes.length > 0) {
+            tipLines.push('状态码: ' + topCodes.map(c => `${c[0]}(${c[1]})`).join(' '));
+        }
+        tipLines.push('---');
+        for (const [mname, mdata] of shown) {
+            tipLines.push(`${mname}: 成功${mdata.success} 失败${mdata.failure} (总${mdata.total})`);
+        }
+        if (othersTotal > 0) {
+            tipLines.push(`其他: ${othersTotal} 次`);
+        }
+        const tipText = _usageEscapeHtml(tipLines.join('\n'));
+
+        const barColor = info.total > 0 ? '#4a90d9' : '#e0e0e0';
+        svg += `<rect x="${x}" y="${y}" width="${barWidth}" height="${Math.max(h, 0)}" fill="${barColor}" rx="3"><title>${tipText}</title></rect>`;
+        svg += `<text x="${x + barWidth / 2}" y="${chartHeight - bottomPad + 16}" font-size="10" fill="#666" text-anchor="middle">${shortDate}</text>`;
+        if (info.total > 0) {
+            svg += `<text x="${x + barWidth / 2}" y="${y - 4}" font-size="10" fill="#333" text-anchor="middle">${info.total}</text>`;
+        }
+    });
+
+    svg += '</svg>';
+    container.innerHTML = svg;
 }
 
-async function resetAllUsageStats() {
-    if (!confirm('确定要重置所有文件的使用统计吗？此操作不可恢复！')) return;
+// 渲染模型明细表（全部模型）
+function renderUsageModelsTable(models) {
+    const tbody = document.getElementById('usageModelsTableBody');
+    if (!tbody) return;
 
+    if (!models || models.length === 0) {
+        tbody.innerHTML = '<tr><td colspan="7" style="text-align:center;color:#999;padding:16px;">暂无模型调用数据</td></tr>';
+        return;
+    }
+
+    let html = '';
+    for (const m of models) {
+        const scodes = Object.entries(m.status_codes || {})
+            .sort((a, b) => b[1] - a[1])
+            .map(c => `${c[0]}:${c[1]}`)
+            .join(' ');
+        html += `<tr style="border-bottom:1px solid #eee;">
+            <td style="padding:8px;font-family:monospace;">${_usageEscapeHtml(m.model)}</td>
+            <td style="padding:8px;color:#28a745;">${m.success_calls || 0}</td>
+            <td style="padding:8px;color:#dc3545;">${m.failure_calls || 0}</td>
+            <td style="padding:8px;font-weight:bold;">${m.total_calls || 0}</td>
+            <td style="padding:8px;">${(m.failure_rate || 0)}%</td>
+            <td style="padding:8px;font-size:12px;color:#666;">${_usageFormatTime(m.last_called_at)}</td>
+            <td style="padding:8px;font-size:12px;">${_usageEscapeHtml(scodes || '—')}</td>
+        </tr>`;
+    }
+    tbody.innerHTML = html;
+}
+
+// 重置确认（清空当前范围全部统计）
+async function resetUsageStatsConfirm() {
+    if (!confirm('确定要重置所有调用统计吗？此操作不可恢复！')) return;
     try {
         const response = await fetch('./usage/reset', {
             method: 'POST',
             headers: getAuthHeaders(),
             body: JSON.stringify({})
         });
-
         const data = await response.json();
-
         if (response.ok && data.success) {
-            showStatus(data.message, 'success');
+            if (typeof showStatus === 'function') showStatus(data.message || '已重置', 'success');
             await refreshUsageStats();
         } else {
-            showStatus(`重置失败: ${data.message || data.detail || data.error || '未知错误'}`, 'error');
+            if (typeof showStatus === 'function') showStatus(`重置失败: ${data.message || '未知错误'}`, 'error');
         }
     } catch (error) {
-        showStatus(`网络错误: ${error.message}`, 'error');
+        if (typeof showStatus === 'function') showStatus(`网络错误: ${error.message}`, 'error');
     }
+}
+
+// 兼容旧函数名：按模型重置
+async function resetSingleUsageStats(model) {
+    if (!confirm(`确定要重置模型 ${model} 的调用统计吗？`)) return;
+    try {
+        const response = await fetch('./usage/reset', {
+            method: 'POST',
+            headers: getAuthHeaders(),
+            body: JSON.stringify({ model })
+        });
+        const data = await response.json();
+        if (response.ok && data.success) {
+            if (typeof showStatus === 'function') showStatus(data.message || '已重置', 'success');
+            await refreshUsageStats();
+        } else {
+            if (typeof showStatus === 'function') showStatus(`重置失败: ${data.message || '未知错误'}`, 'error');
+        }
+    } catch (error) {
+        if (typeof showStatus === 'function') showStatus(`网络错误: ${error.message}`, 'error');
+    }
+}
+
+// 兼容旧函数名：全部重置
+async function resetAllUsageStats() {
+    return resetUsageStatsConfirm();
 }
 
 // =====================================================================

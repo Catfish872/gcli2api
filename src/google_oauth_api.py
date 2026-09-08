@@ -531,6 +531,11 @@ async def select_default_project(projects: List[Dict[str, Any]]) -> Optional[str
     return project_id
 
 
+def _is_geminicli_user_agent(user_agent: str) -> bool:
+    """判断 helper 是否由 Gemini CLI 路径调用。"""
+    return (user_agent or "").strip().lower().startswith("geminicli/")
+
+
 async def fetch_project_id_and_tier(
     access_token: str,
     user_agent: str,
@@ -577,13 +582,26 @@ async def fetch_project_id_and_tier(
 
         return tier_mapping.get(raw_tier.lower(), "pro")
 
+    is_geminicli = _is_geminicli_user_agent(user_agent)
     subscription_tier = None
     credit_amount: Optional[int] = None
     tier_details: dict = {}
 
-    # 步骤 1: 尝试 loadCodeAssist
+    def _build_result(project_id: Optional[str]):
+        if detailed:
+            return project_id, subscription_tier, credit_amount, tier_details
+        if include_credits:
+            return project_id, subscription_tier, credit_amount
+        return project_id, subscription_tier
+
+    # 步骤 1: 尝试 loadCodeAssist。Gemini CLI 使用官方 client metadata；
+    # Antigravity 保持原有 metadata。
     try:
-        project_id, raw_tier, raw_credit_amount, tier_details = await _try_load_code_assist(api_base_url, headers)
+        project_id, raw_tier, raw_credit_amount, tier_details = await _try_load_code_assist(
+            api_base_url,
+            headers,
+            geminicli=is_geminicli,
+        )
         subscription_tier = _map_raw_tier(raw_tier)
 
         if raw_credit_amount is not None:
@@ -603,44 +621,76 @@ async def fetch_project_id_and_tier(
             )
 
         if project_id:
-            if detailed:
-                return project_id, subscription_tier, credit_amount, tier_details
-            if include_credits:
-                return project_id, subscription_tier, credit_amount
-            return project_id, subscription_tier
+            return _build_result(project_id)
 
-        log.warning("[fetch_project_id_and_tier] loadCodeAssist did not return project_id, falling back to onboardUser")
+        if not is_geminicli:
+            log.warning("[fetch_project_id_and_tier] loadCodeAssist did not return project_id, falling back to onboardUser")
 
     except Exception as e:
         log.warning(f"[fetch_project_id_and_tier] loadCodeAssist failed: {type(e).__name__}: {e}")
-        log.warning("[fetch_project_id_and_tier] Falling back to onboardUser")
+        if not is_geminicli:
+            log.warning("[fetch_project_id_and_tier] Falling back to onboardUser")
 
-    # 步骤 2: 回退到 onboardUser
+    # Gemini CLI 不得进入 Antigravity onboardUser。对于检验/额度辅助路径，
+    # 如果 loadCodeAssist 没有给出 managed project，则回退到现有 GCP project discovery，
+    # 再以官方 Gemini CLI metadata 带 duetProject 复查一次。
+    if is_geminicli:
+        try:
+            temp_credentials = Credentials(
+                access_token=access_token,
+                expires_at=datetime.now(timezone.utc) + timedelta(minutes=10),
+            )
+            projects = await get_user_projects(temp_credentials)
+            selected_project_id = await select_default_project(projects)
+
+            if selected_project_id:
+                try:
+                    backend_project_id, raw_tier, raw_credit_amount, second_tier_details = await _try_load_code_assist(
+                        api_base_url,
+                        headers,
+                        geminicli=True,
+                        project_id=selected_project_id,
+                    )
+                    if second_tier_details:
+                        tier_details = second_tier_details
+                    if raw_tier:
+                        subscription_tier = _map_raw_tier(raw_tier)
+                    if raw_credit_amount is not None:
+                        try:
+                            credit_amount = int(raw_credit_amount)
+                        except (TypeError, ValueError):
+                            log.warning(
+                                f"[fetch_project_id_and_tier] Invalid credit_amount: {raw_credit_amount}"
+                            )
+
+                    return _build_result(backend_project_id or selected_project_id)
+                except Exception as e:
+                    log.warning(
+                        f"[fetch_project_id_and_tier] Gemini CLI loadCodeAssist with project failed: {type(e).__name__}: {e}"
+                    )
+                    return _build_result(selected_project_id)
+
+        except Exception as e:
+            log.warning(
+                f"[fetch_project_id_and_tier] Gemini CLI project discovery failed: {type(e).__name__}: {e}"
+            )
+
+        return _build_result(None)
+
+    # 步骤 2: Antigravity 回退到 onboardUser。
     try:
         project_id = await _try_onboard_user(api_base_url, headers)
         if project_id:
-            if detailed:
-                return project_id, subscription_tier, credit_amount, tier_details
-            if include_credits:
-                return project_id, subscription_tier, credit_amount
-            return project_id, subscription_tier
+            return _build_result(project_id)
 
         log.error("[fetch_project_id_and_tier] Failed to get project_id from both loadCodeAssist and onboardUser")
-        if detailed:
-            return None, subscription_tier, credit_amount, tier_details
-        if include_credits:
-            return None, subscription_tier, credit_amount
-        return None, subscription_tier
+        return _build_result(None)
 
     except Exception as e:
         log.error(f"[fetch_project_id_and_tier] onboardUser failed: {type(e).__name__}: {e}")
         import traceback
         log.debug(f"[fetch_project_id_and_tier] Traceback: {traceback.format_exc()}")
-        if detailed:
-            return None, subscription_tier, credit_amount, tier_details
-        if include_credits:
-            return None, subscription_tier, credit_amount
-        return None, subscription_tier
+        return _build_result(None)
 
 
 def _classify_tier_for_display(raw_id: Optional[str], raw_name: Optional[str]) -> str:
@@ -718,23 +768,34 @@ def _extract_tier_details(data: dict) -> dict:
 
 async def _try_load_code_assist(
     api_base_url: str,
-    headers: dict
+    headers: dict,
+    geminicli: bool = False,
+    project_id: Optional[str] = None,
 ) -> Tuple[Optional[str], Optional[str], Optional[str], dict]:
     """
     尝试通过 loadCodeAssist 获取 project_id 和订阅等级
 
-    Returns:
-        (project_id, subscription_tier, credit_amount, tier_details) 元组
-        subscription_tier 为后端原始 tier id（如 standard-tier），可能为 None
-        credit_amount 为字符串格式积分或 None
-        tier_details 为完整 tier 信息字典（失败时为空字典）
+    Gemini CLI 路径使用官方 IDE_UNSPECIFIED / PLATFORM_UNSPECIFIED / GEMINI metadata；
+    Antigravity 路径保持原有 metadata。
     """
     request_url = f"{api_base_url.rstrip('/')}/v1internal:loadCodeAssist"
-    request_body = {
-        "metadata": {
-            "ideType": "ANTIGRAVITY"
+
+    if geminicli:
+        metadata = {
+            "ideType": "IDE_UNSPECIFIED",
+            "platform": "PLATFORM_UNSPECIFIED",
+            "pluginType": "GEMINI",
         }
-    }
+        request_body: Dict[str, Any] = {"metadata": metadata}
+        if project_id:
+            request_body["cloudaicompanionProject"] = project_id
+            metadata["duetProject"] = project_id
+    else:
+        request_body = {
+            "metadata": {
+                "ideType": "ANTIGRAVITY"
+            }
+        }
 
     log.debug(f"[loadCodeAssist] Fetching project_id from: {request_url}")
     log.debug(f"[loadCodeAssist] Request body: {request_body}")
@@ -777,10 +838,15 @@ async def _try_load_code_assist(
         if tier_details.get("current_tier_id") or data.get("currentTier"):
             log.info("[loadCodeAssist] User is already activated")
 
-            # 使用服务器返回的 project_id
-            project_id = data.get("cloudaicompanionProject")
-            if project_id:
-                log.info(f"[loadCodeAssist] Successfully fetched project_id: {project_id}, tier: {subscription_tier}")
+            # 优先使用服务器返回的 project_id。
+            backend_project_id = data.get("cloudaicompanionProject")
+            if backend_project_id:
+                log.info(f"[loadCodeAssist] Successfully fetched project_id: {backend_project_id}, tier: {subscription_tier}")
+                return backend_project_id, subscription_tier, credit_amount, tier_details
+
+            # 官方 Gemini CLI 在调用方已有 project 时允许继续使用该 project。
+            if geminicli and project_id:
+                log.info(f"[loadCodeAssist] No backend project returned, using provided project_id: {project_id}")
                 return project_id, subscription_tier, credit_amount, tier_details
 
             log.warning("[loadCodeAssist] No project_id in response")
@@ -791,7 +857,7 @@ async def _try_load_code_assist(
     else:
         log.warning(f"[loadCodeAssist] Failed: HTTP {response.status_code}")
         log.warning(f"[loadCodeAssist] Response body: {response.text[:500]}")
-        raise Exception(f"HTTP {response.status_code}: {response.text[:200]}")
+        raise Exception(f"HTTP {response.status_code}: {response.text[:200]}" )
 
 
 async def retrieve_user_quota(
